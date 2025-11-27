@@ -49,7 +49,7 @@ def load_and_clean_data(uploaded_files):
 def run_portfolio_simulation(trades_df, initial_capital, risk_percent, r_multiple_cap=0, fixed_risk_amount=0,
                              riesgo_historico_por_trade=0):
     if trades_df.empty or 'Close time' not in trades_df.columns or trades_df['Close time'].isna().all():
-        return pd.Series([initial_capital]), initial_capital, 0
+        return pd.Series([initial_capital], index=[pd.Timestamp.min]), initial_capital, 0
 
     trades_df = trades_df.sort_values(by='Close time').copy()
 
@@ -68,7 +68,7 @@ def run_portfolio_simulation(trades_df, initial_capital, risk_percent, r_multipl
     trades_df.replace([np.inf, -np.inf], np.nan, inplace=True)
     trades_df.dropna(subset=['R_multiple'], inplace=True)
 
-    if trades_df.empty: return pd.Series([initial_capital]), initial_capital, 0
+    if trades_df.empty: return pd.Series([initial_capital], index=[pd.Timestamp.min]), initial_capital, 0
 
     if r_multiple_cap > 0:
         trades_df['R_multiple'] = np.where(trades_df['R_multiple'] > r_multiple_cap, r_multiple_cap,
@@ -99,8 +99,8 @@ def run_portfolio_simulation(trades_df, initial_capital, risk_percent, r_multipl
     equity_series = pd.Series(equity_curve_list)
     final_balance = equity_series.iloc[-1]
 
-    plot_index = pd.to_datetime(
-        [trades_df['Close time'].min() - pd.Timedelta(seconds=1)] + list(trades_df['Close time']))
+    start_time = trades_df['Close time'].min() if not trades_df.empty else pd.Timestamp.now()
+    plot_index = pd.to_datetime([start_time - pd.Timedelta(seconds=1)] + list(trades_df['Close time']))
     equity_series.index = plot_index
 
     return equity_series, final_balance, max_drawdown_pct
@@ -303,38 +303,6 @@ def get_strategy_returns_for_asset(_asset_df):
     if not all_returns: return pd.DataFrame()
     return pd.concat(all_returns, axis=1).fillna(0)
 
-@st.cache_data
-def get_strategy_level_stats(trades_df):
-    """
-    Calcula métricas básicas por estrategia para poder filtrar
-    antes de entrar al optimizador.
-    """
-    if trades_df.empty or 'Result name' not in trades_df.columns:
-        return pd.DataFrame()
-
-    stats = []
-    for strat_name, df_s in trades_df.groupby('Result name'):
-        # Usamos la lógica histórica ya existente
-        eq, start, end, dd, ok = calculate_isolated_historical_performance(df_s)
-        if not ok or start <= 0 or end <= 0:
-            continue
-
-        cagr = calculate_cagr(start, end, df_s)
-        mar = calculate_mar(cagr, dd)
-        n_trades = len(df_s)
-
-        stats.append({
-            "Result name": strat_name,
-            "NumTrades": n_trades,
-            "CAGR": cagr,
-            "MaxDD": dd,
-            "MAR": mar
-        })
-
-    if not stats:
-        return pd.DataFrame()
-
-    return pd.DataFrame(stats)
 
 def calculate_historical_monthly_performance(trades_df, initial_capital, risk_per_trade_pct, r_multiple_cap=0,
                                              fixed_risk_amount=0, riesgo_historico_por_trade=0):
@@ -374,6 +342,43 @@ def calculate_monthly_recovery_dd(portfolio_trades, initial_capital, risk_per_tr
         max_recoverable_dd = max(max_recoverable_dd, monthly_max_dd)
     return max_recoverable_dd
 
+def get_strategy_level_stats(trades_df):
+    """
+    Calcula métricas básicas por estrategia (Result name) usando el histórico aislado de cada una.
+    Devuelve un DataFrame con:
+      - Result name
+      - CAGR
+      - MaxDD
+      - MAR
+      - NumTrades
+    """
+    if trades_df.empty or 'Result name' not in trades_df.columns:
+        return pd.DataFrame()
+
+    stats = []
+
+    for strat_name, df in trades_df.groupby('Result name'):
+        # Curva histórica aislada de la estrategia
+        equity_curve, start_balance, end_balance, max_dd, can_calc = calculate_isolated_historical_performance(df)
+
+        if not can_calc or start_balance <= 0 or end_balance <= 0:
+            continue
+
+        cagr = calculate_cagr(start_balance, end_balance, df)
+        mar = calculate_mar(cagr, max_dd)
+
+        stats.append({
+            "Result name": strat_name,
+            "CAGR": cagr,
+            "MaxDD": max_dd,
+            "MAR": mar,
+            "NumTrades": len(df)
+        })
+
+    if not stats:
+        return pd.DataFrame()
+
+    return pd.DataFrame(stats)
 
 def calculate_ror(edge, capital_units):
     if edge <= 0: return 100.0
@@ -415,7 +420,7 @@ def run_monte_carlo_simulation_vectorized(trades_df, initial_capital, risk_per_t
             return 0, 0, 0
         trades_df['R_multiple'] = trades_df['Profit/Loss'] / riesgo_historico_por_trade
     else:
-        if 'MAE ($)' not in trades_df.columns or trades_df['MAE ($)'].abs().sum() == 0:
+        if 'MAE ($)' not in trades_df.columns or 'MAE ($)'.abs().sum() == 0:
             st.warning("No se puede ejecutar Monte Carlo sin datos de MAE ($) válidos.");
             return 0, 0, 0
         trades_df = trades_df[trades_df['MAE ($)'].abs() > 0.0001].copy()
@@ -549,7 +554,7 @@ def get_portfolio_metrics_cached(_data_subset_tuple, _columns_list, combo_tuple,
                                        _r_multiple_cap, _fixed_risk_amount, _riesgo_historico_por_trade)
 
 
-# --- INICIO: FUNCIONES PARA HIERARCHICAL RISK PARITY (HRP) ---
+# --- INICIO: FUNCIONES PARA HIERARCHICAL RISK PARITY (HRP) Y OPTIMAL F ---
 def get_daily_returns(trades_df):
     if trades_df.empty or 'Result name' not in trades_df.columns:
         return pd.DataFrame()
@@ -651,7 +656,258 @@ def create_hrp_resampled_portfolio(champion_trades_df, hrp_weights):
     return pd.DataFrame(new_portfolio_trades).sort_values('Close time').reset_index(drop=True)
 
 
-# --- FIN: FUNCIONES PARA HIERARCHICAL RISK PARITY (HRP) ---
+def calculate_optimal_f(trades_df, riesgo_historico_por_trade):
+    if trades_df.empty or riesgo_historico_por_trade <= 0: return 0.0
+    if 'Profit/Loss' not in trades_df.columns: return 0.0
+
+    r_multiples = trades_df['Profit/Loss'] / riesgo_historico_por_trade
+    r_multiples = r_multiples.dropna()
+    if r_multiples.empty: return 0.0
+
+    best_f, max_twr = 0, 1.0
+
+    for f_int in range(1, 201):
+        f = f_int / 200.0
+        growth_factors = 1 + f * r_multiples
+        if (growth_factors <= 0).any():
+            twr = 0
+        else:
+            log_twr = np.sum(np.log(growth_factors))
+            twr = np.exp(log_twr)
+        if twr > max_twr:
+            max_twr = twr
+            best_f = f
+    return best_f
+
+
+# --- FIN: FUNCIONES PARA HIERARCHICAL RISK PARITY (HRP) Y OPTIMAL F ---
+
+# --- INICIO: NUEVAS FUNCIONES PARA CALIBRACIÓN DE RIESGO ---
+def run_operational_simulation_with_rebalancing(
+        trades_df, initial_capital, risk_percent, hrp_weights,
+        r_multiple_cap=0, riesgo_historico_por_trade=0, fixed_risk_amount=0
+):
+    """
+    Motor de simulación de alta fidelidad que replica la operativa real con "cajas de capital"
+    y rebalanceo semanal.
+    """
+    if trades_df.empty or 'Close time' not in trades_df.columns or trades_df[
+        'Close time'].isna().all() or hrp_weights is None:
+        return pd.Series([initial_capital]), initial_capital, 0
+
+    # 1. Preparar trades y calcular R-múltiples
+    trades_df = trades_df.sort_values(by='Close time').copy()
+    if riesgo_historico_por_trade > 0:
+        trades_df['R_multiple'] = trades_df['Profit/Loss'] / riesgo_historico_por_trade
+    else:
+        if 'MAE ($)' not in trades_df.columns or 'MAE ($)'.abs().sum() < 0.0001:
+            return pd.Series([initial_capital]), initial_capital, 0
+        trades_df = trades_df[trades_df['MAE ($)'].abs() > 0.0001].copy()
+        trades_df['R_multiple'] = trades_df['Profit/Loss'] / trades_df['MAE ($)'].abs()
+
+    trades_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    trades_df.dropna(subset=['R_multiple'], inplace=True)
+    if r_multiple_cap > 0:
+        trades_df['R_multiple'] = np.where(trades_df['R_multiple'] > r_multiple_cap, r_multiple_cap,
+                                           trades_df['R_multiple'])
+    if trades_df.empty:
+        return pd.Series([initial_capital]), initial_capital, 0
+
+    # 2. Inicializar cajas de capital, riesgos y curva de equity
+    strategy_names = hrp_weights.index.tolist()
+    capital_boxes = {name: initial_capital * weight for name, weight in hrp_weights.items()}
+    weekly_risk_euros = {}
+
+    total_balance = initial_capital
+    peak_balance = initial_capital
+    max_drawdown_pct = 0.0
+
+    equity_points = [{'time': trades_df['Close time'].iloc[0] - pd.Timedelta(seconds=1), 'balance': initial_capital}]
+
+    current_week_identifier = None
+
+    # 3. Bucle principal a través de los trades
+    for _, trade in trades_df.iterrows():
+        trade_week_identifier = (trade['Close time'].year, trade['Close time'].isocalendar().week)
+
+        # 4. Comprobación de Rebalanceo Semanal
+        if trade_week_identifier != current_week_identifier:
+            current_week_identifier = trade_week_identifier
+            for strat_name in strategy_names:
+                box_capital = capital_boxes.get(strat_name, 0)
+                # La lógica de riesgo debe coincidir con la simulación principal
+                risk_amount = fixed_risk_amount if fixed_risk_amount > 0 else box_capital * (risk_percent / 100)
+                weekly_risk_euros[strat_name] = risk_amount if risk_amount > 0 else 0
+
+        # 5. Procesar el trade
+        trade_strategy = trade['Result name']
+        if trade_strategy not in strategy_names:
+            continue
+
+        risk_for_this_trade_usd = weekly_risk_euros.get(trade_strategy, 0)
+
+        if risk_for_this_trade_usd > capital_boxes.get(trade_strategy, 0):
+            risk_for_this_trade_usd = capital_boxes.get(trade_strategy, 0)
+
+        simulated_profit = risk_for_this_trade_usd * trade['R_multiple']
+
+        # Actualizar balances
+        capital_boxes[trade_strategy] += simulated_profit
+        total_balance += simulated_profit
+
+        if total_balance <= 0: total_balance = 0
+        if capital_boxes[trade_strategy] < 0: capital_boxes[trade_strategy] = 0
+
+        peak_balance = max(peak_balance, total_balance)
+
+        if peak_balance > 0:
+            current_drawdown_pct = ((peak_balance - total_balance) / peak_balance) * 100
+            max_drawdown_pct = max(max_drawdown_pct, current_drawdown_pct)
+
+        equity_points.append({'time': trade['Close time'], 'balance': total_balance})
+
+    # 6. Finalizar la curva de equity
+    if not equity_points:
+        return pd.Series([initial_capital]), initial_capital, 0
+
+    equity_df = pd.DataFrame(equity_points).drop_duplicates(subset='time', keep='last').set_index('time')
+    equity_series = equity_df['balance']
+    final_balance = equity_series.iloc[-1] if not equity_series.empty else initial_capital
+
+    return equity_series, final_balance, max_drawdown_pct
+
+
+def run_walk_forward_simulation(
+        trades_df_is, trades_df_oos, hrp_weights, initial_capital,
+        optimal_f_fraction, optimal_f_window_years,
+        riesgo_historico_por_trade, r_multiple_cap
+):
+    """
+    Ejecuta una simulación Walk-Forward utilizando el motor de simulación operativa de alta fidelidad.
+    """
+    if trades_df_oos.empty:
+        return 0, 100, 0, pd.Series([initial_capital]), []
+
+    trades_df_oos_sorted = trades_df_oos.sort_values('Close time').copy()
+    trades_df_oos_sorted['Year'] = trades_df_oos_sorted['Close time'].dt.year
+    oos_years = sorted(trades_df_oos_sorted['Year'].unique())
+
+    all_oos_equity_points = [
+        {'time': trades_df_oos_sorted['Close time'].iloc[0] - pd.Timedelta(seconds=1), 'balance': initial_capital}]
+    current_balance = initial_capital
+    annual_risk_data = []
+
+    if trades_df_is.empty or 'Close time' not in trades_df_is.columns:
+        return 0, 100, 0, pd.Series([initial_capital]), []
+
+    current_lookback_data = trades_df_is.copy()
+
+    for year in oos_years:
+        oos_year_df = trades_df_oos_sorted[trades_df_oos_sorted['Year'] == year]
+        if oos_year_df.empty:
+            continue
+
+        resampled_lookback = create_hrp_resampled_portfolio(current_lookback_data, hrp_weights)
+        optimal_f = calculate_optimal_f(resampled_lookback, riesgo_historico_por_trade)
+        risk_to_apply = optimal_f * optimal_f_fraction
+
+        annual_risk_data.append({
+            "Año de Aplicación": year,
+            "Optimal F Calculado": optimal_f,
+            "Riesgo Aplicado (%)": risk_to_apply * 100
+        })
+
+        _, final_balance, _, equity_points_year = run_operational_simulation_with_rebalancing(
+            trades_df=oos_year_df,
+            initial_capital=current_balance,
+            risk_percent=risk_to_apply * 100,
+            hrp_weights=hrp_weights,
+            r_multiple_cap=r_multiple_cap,
+            riesgo_historico_por_trade=riesgo_historico_por_trade
+        )
+
+        if equity_points_year:
+            all_oos_equity_points.extend(equity_points_year[1:])
+
+        current_balance = final_balance if final_balance > 0 else 0
+
+        current_lookback_data = pd.concat([current_lookback_data, oos_year_df]).sort_values('Close time')
+        min_date_in_window = current_lookback_data['Close time'].max() - pd.DateOffset(years=optimal_f_window_years)
+        current_lookback_data = current_lookback_data[current_lookback_data['Close time'] >= min_date_in_window]
+
+    if len(all_oos_equity_points) <= 1:
+        return 0, 100, 0, pd.Series([initial_capital]), []
+
+    equity_df = pd.DataFrame(all_oos_equity_points).drop_duplicates(subset='time', keep='last').set_index('time')
+    full_equity_curve = equity_df['balance'].sort_index()
+
+    final_balance_total = full_equity_curve.iloc[-1]
+    cagr = calculate_cagr(initial_capital, final_balance_total, trades_df_oos)
+    peak = full_equity_curve.cummax()
+    max_dd = (((peak - full_equity_curve) / peak).max() * 100) if peak.max() > 0 else 0
+    mar = calculate_mar(cagr, max_dd) if cagr is not None else 0
+
+    return cagr, max_dd, mar, full_equity_curve, annual_risk_data
+
+
+def find_optimal_mar_fraction(
+        trades_df_is, trades_df_oos, hrp_weights, initial_capital,
+        optimal_f_window_years, riesgo_historico_por_trade, r_multiple_cap,
+        max_f_fraction_percentage
+):
+    """
+    Encuentra la mejor fracción de Optimal F usando la simulación operativa de alta fidelidad.
+    """
+    upper_bound = (max_f_fraction_percentage / 100.0) + 0.01
+    fractions_to_test = np.arange(0.05, upper_bound, 0.05)
+    results = []
+
+    st.write("Calibrando en datos In-Sample con simulación operativa para encontrar la fracción óptima...")
+    progress_bar = st.progress(0)
+
+    for i, fraction in enumerate(fractions_to_test):
+        cagr, max_dd, mar, _, _ = run_walk_forward_simulation(
+            trades_df_is, trades_df_is, hrp_weights, initial_capital,
+            fraction, optimal_f_window_years, riesgo_historico_por_trade, r_multiple_cap
+        )
+        results.append({
+            "Fracción de F Aplicada": f"{fraction * 100:.0f}%",
+            "CAGR (IS)": cagr,
+            "Max Drawdown (IS) (%)": max_dd,
+            "MAR Ratio (IS)": mar
+        })
+        progress_bar.progress((i + 1) / len(fractions_to_test))
+
+    results_df = pd.DataFrame(results)
+
+    if results_df.empty or "MAR Ratio (IS)" not in results_df.columns or results_df[
+        "MAR Ratio (IS)"].isnull().all() or (results_df["MAR Ratio (IS)"] == 0).all():
+        st.error("No se pudieron generar resultados válidos durante la calibración.")
+        return None, None, None, None
+
+    best_is_row = results_df.loc[results_df["MAR Ratio (IS)"].idxmax()]
+    recommended_fraction_str = best_is_row["Fracción de F Aplicada"]
+    recommended_fraction_val = float(recommended_fraction_str.replace('%', '')) / 100.0
+
+    st.success("Calibración completada.")
+
+    st.write(
+        f"Validando la fracción recomendada ({recommended_fraction_str}) en datos Out-of-Sample con simulación operativa...")
+    oos_cagr, oos_dd, oos_mar, _, oos_annual_risk_data = run_walk_forward_simulation(
+        trades_df_is, trades_df_oos, hrp_weights, initial_capital,
+        recommended_fraction_val, optimal_f_window_years, riesgo_historico_por_trade, r_multiple_cap
+    )
+
+    validation_results = {
+        "CAGR (OOS)": oos_cagr,
+        "Max Drawdown (OOS) (%)": oos_dd,
+        "MAR Ratio (OOS)": oos_mar
+    }
+
+    return results_df, best_is_row, validation_results, oos_annual_risk_data
+
+
+# --- FIN: NUEVAS FUNCIONES ---
 
 
 # --- INTERFAZ DE USUARIO ---
@@ -715,28 +971,21 @@ else:
                 if limit_type == 'Automático (Recomendado)': st.info(f"Límite fijado en {dynamic_r_cap:.2f}R")
 
             data_full_sorted = data_full.sort_values('Close time').reset_index(drop=True)
-
             if oos_percentage > 0:
                 split_index = int(len(data_full_sorted) * (1 - oos_percentage / 100))
-                training_data = data_full_sorted.iloc[:split_index].copy()
-                validation_data = data_full_sorted.iloc[split_index:].copy()
+                training_data, validation_data = data_full_sorted.iloc[:split_index].copy(), data_full_sorted.iloc[
+                                                                                             split_index:].copy()
                 data_for_analysis = training_data
             else:
-                training_data = data_full_sorted
-                validation_data = pd.DataFrame()
+                training_data, validation_data = data_full_sorted, pd.DataFrame()
                 data_for_analysis = data_full_sorted
 
-            # >>> NUEVO: calcular stats por estrategia para el training <<<
-            strategy_stats = get_strategy_level_stats(training_data)
-
-            # Después de esto ya siguen las pestañas:
-            tab1, tab2, tab3, tab4 = st.tabs(["Constructor de Portafolios",
-                                              "Optimizador de Portafolios",
-                                              "Análisis de Riesgo",
-                                              "Análisis de Debilidades"])
+            tab1, tab2, tab3, tab4 = st.tabs(
+                ["🏗️ Constructor de Portafolios", "🔨 Optimizador de Portafolios", "🔬 Análisis de Riesgo",
+                 "📉 Análisis de Debilidades"])
 
             calculation_mode = st.radio("Selecciona el modo de cálculo para las métricas y gráficos principales:",
-                                        ('Simulación (Interés Compuesto)', 'Histórico (Datos del CSV)'),
+                                        ('Simulación (Interés Compuesto)', 'Histórico (Datos del CSV)'), index=1,
                                         horizontal=True, key='calc_mode')
             st.divider()
 
@@ -815,6 +1064,8 @@ else:
                     "Encuentra el número ideal de estrategias y la combinación perfecta usando métodos de búsqueda avanzados.")
 
                 # --- FASE 0: FILTRO DE ESTRATEGIAS ANTES DEL OPTIMIZADOR ---
+                strategy_stats = get_strategy_level_stats(training_data)
+
                 st.subheader("FASE 0: Filtro de calidad individual (antes de optimizar)")
 
                 if strategy_stats.empty:
@@ -822,22 +1073,29 @@ else:
                     filtered_stats = pd.DataFrame()
                 else:
                     col_f1, col_f2, col_f3, col_f4 = st.columns(4)
-                    min_trades = col_f1.number_input("Mín. nº de trades", min_value=10, max_value=2000, value=100,
-                                                     step=10)
-                    max_dd_ind = col_f2.number_input("Máx. DD individual (%)", min_value=2.0, max_value=80.0,
-                                                     value=35.0, step=1.0)
-                    min_mar_ind = col_f3.number_input("Mín. MAR individual", min_value=0.0, max_value=5.0, value=0.30,
-                                                      step=0.05)
-                    max_candidates = col_f4.number_input("Máx. estrategias a enviar al optimizador",
-                                                         min_value=10, max_value=400, value=80, step=5)
 
+                    min_trades = col_f1.number_input(
+                        "Mín. nº de trades", min_value=10, max_value=2000, value=100, step=10
+                    )
+                    max_dd_ind = col_f2.number_input(
+                        "Máx. DD individual (%)", min_value=1.0, max_value=80.0, value=3.0, step=1.0
+                    )
+                    min_mar_ind = col_f3.number_input(
+                        "Mín. MAR individual", min_value=0.0, max_value=8.0, value=0.30, step=0.05
+                    )
+                    max_candidates = col_f4.number_input(
+                        "Máx. estrategias a enviar al optimizador",
+                        min_value=1, max_value=400, value=80, step=5
+                    )
+
+                    # FILTRO PRINCIPAL
                     filtered_stats = strategy_stats[
                         (strategy_stats["NumTrades"] >= min_trades) &
                         (strategy_stats["MaxDD"] <= max_dd_ind) &
                         (strategy_stats["MAR"] >= min_mar_ind)
                         ].copy()
 
-                    # Ordenamos por MAR y nos quedamos con las mejores
+                    # Orden por MAR y limitar a número máximo de estrategias
                     filtered_stats = filtered_stats.sort_values("MAR", ascending=False).head(max_candidates)
 
                     st.info(
@@ -847,6 +1105,7 @@ else:
 
                     with st.expander("Ver tabla de estrategias filtradas (Top por MAR)"):
                         st.dataframe(filtered_stats, use_container_width=True)
+
 
                 mode_display = "Simulación (Interés Compuesto)" if calculation_mode == 'Simulación (Interés Compuesto)' else "Histórico (Datos del CSV)"
                 st.info(f"Modo de Optimización actual: **{mode_display}**")
@@ -885,12 +1144,7 @@ else:
                     if 'optimizer_results' in st.session_state: del st.session_state.optimizer_results
                     if 'hrp_results' in st.session_state: del st.session_state.hrp_results
 
-                    if filtered_stats.empty:
-                        st.error("No hay estrategias tras aplicar los filtros. Afloja un poco los criterios.")
-                        all_strategies_list = []
-                    else:
-                        all_strategies_list = list(filtered_stats['Result name'].unique())
-
+                    all_strategies_list = list(training_data['Result name'].unique())
                     champions_by_size = []
                     sizes_to_test = range(portfolio_size_range[1], portfolio_size_range[0] - 1, -1)
 
@@ -998,81 +1252,14 @@ else:
                             progress_bar.progress((i + 1) / total_steps)
 
                         st.success("¡Búsqueda exhaustiva completada!")
-
                         if champions_by_size:
-                            # --- NUEVO: calcular robustez IS vs OOS para cada campeón ---
-                            if oos_percentage > 0 and not validation_data.empty:
-                                def calc_degradation(is_val, oos_val, is_lower_better=False):
-                                    if abs(is_val) < 1e-6:
-                                        return 0.0
-                                    degradation = ((oos_val - is_val) / abs(is_val)) * 100
-                                    return degradation if not is_lower_better else -degradation
-
-
-                                for champ in champions_by_size:
-                                    combo_tuple = tuple(sorted(champ["combo"]))
-
-                                    # métricas In-Sample (training)
-                                    is_mar, is_dd, is_profit = get_portfolio_metrics_final(
-                                        training_data,
-                                        combo_tuple,
-                                        calculation_mode,
-                                        initial_capital,
-                                        risk_per_trade_pct,
-                                        r_multiple_cap,
-                                        fixed_risk_amount,
-                                        riesgo_historico_por_trade
-                                    )
-
-                                    # métricas Out-of-Sample (validation)
-                                    oos_mar, oos_dd, oos_profit = get_portfolio_metrics_final(
-                                        validation_data,
-                                        combo_tuple,
-                                        calculation_mode,
-                                        initial_capital,
-                                        risk_per_trade_pct,
-                                        r_multiple_cap,
-                                        fixed_risk_amount,
-                                        riesgo_historico_por_trade
-                                    )
-
-                                    champ["is_mar"] = is_mar
-                                    champ["is_dd"] = is_dd
-                                    champ["is_profit"] = is_profit
-                                    champ["oos_mar"] = oos_mar
-                                    champ["oos_dd"] = oos_dd
-                                    champ["oos_profit"] = oos_profit
-
-                                    champ["mar_deg"] = calc_degradation(is_mar, oos_mar)
-                                    champ["dd_deg"] = calc_degradation(is_dd, oos_dd, is_lower_better=True)
-
-                                    # MISMOS UMBRALES que la luz roja de la app
-                                    champ["is_robust"] = (champ["mar_deg"] >= -50) and (champ["dd_deg"] <= 50)
-                            else:
-                                # si no hay OOS, se consideran robustos por defecto
-                                for champ in champions_by_size:
-                                    champ["is_robust"] = True
-
-                            # --- NUEVO: elegir campeón solo entre robustos (verde/amarillo) ---
-                            robust_candidates = [c for c in champions_by_size if c.get("is_robust", True)]
-                            if not robust_candidates:
-                                # si todos son rojos, usamos todos pero luego ya lo verás en rojo
-                                robust_candidates = champions_by_size
-
-                            absolute_champion = sorted(
-                                robust_candidates,
-                                key=lambda x: x[sort_key],
-                                reverse=reverse_sort
-                            )[0]
-
-                            st.session_state.optimizer_results = {
-                                "absolute_champion": absolute_champion,
-                                "champions_by_size": champions_by_size
-                            }
+                            absolute_champion = \
+                            sorted(champions_by_size, key=lambda x: x[sort_key], reverse=reverse_sort)[0]
+                            st.session_state.optimizer_results = {"absolute_champion": absolute_champion,
+                                                                  "champions_by_size": champions_by_size}
                         else:
                             st.warning("No se encontraron resultados válidos.")
-                            if 'optimizer_results' in st.session_state:
-                                del st.session_state.optimizer_results
+                            if 'optimizer_results' in st.session_state: del st.session_state.optimizer_results
 
                 if 'optimizer_results' in st.session_state:
                     res = st.session_state.optimizer_results
@@ -1146,37 +1333,12 @@ else:
 
                     st.markdown("---");
                     st.header("📊 Tabla Comparativa de Campeones por Tamaño")
-
-                    champions_df = pd.DataFrame(champs_by_size)
-
-                    # columnas legibles
-                    champions_df = champions_df.rename(columns={
-                        "size": "Tamaño",
-                        "mar_ratio": "MAR In-Sample (búsqueda)",
-                        "drawdown": "Max DD In-Sample (%)",
-                        "profit": "Profit In-Sample (%)",
-                        "is_mar": "MAR IS",
-                        "is_dd": "Max DD IS (%)",
-                        "oos_mar": "MAR OOS",
-                        "oos_dd": "Max DD OOS (%)",
-                        "is_robust": "Robusto",
-                    })
-
-                    # combo en texto (para que veas qué estrategias lleva)
-                    champions_df["Estrategias"] = champions_df["combo"].apply(
-                        lambda c: ", ".join(c) if isinstance(c, (list, tuple)) else str(c)
-                    )
-
-                    cols_base = ["Tamaño", "MAR In-Sample (búsqueda)", "Max DD In-Sample (%)", "Profit In-Sample (%)"]
-                    cols_oos = ["MAR IS", "Max DD IS (%)", "MAR OOS", "Max DD OOS (%)", "Robusto"]
-                    cols_extra = [c for c in cols_oos if c in champions_df.columns]
-
-                    cols_to_show = cols_base + cols_extra + ["Estrategias"]
-
+                    champions_df = pd.DataFrame(champs_by_size).rename(
+                        columns={"size": "Tamaño", "mar_ratio": "Mejor MAR Ratio", "drawdown": "Max DD (%)",
+                                 "profit": "Mejor Profit (%)"})
                     st.dataframe(
-                        champions_df[cols_to_show].sort_values(by="Tamaño", ascending=True),
-                        use_container_width=True
-                    )
+                        champions_df[['Tamaño', 'Mejor MAR Ratio', 'Max DD (%)', 'Mejor Profit (%)']].sort_values(
+                            by="Tamaño", ascending=True), use_container_width=True)
 
                     if search_method == "Algoritmo Evolutivo (Avanzado)":
                         st.markdown("---");
@@ -1203,7 +1365,7 @@ else:
                     st.header("Paso 3: Refinar Asignación de Riesgo con HRP (Opcional)")
                     st.info(
                         "Hierarchical Risk Parity (HRP) optimiza la asignación de capital entre las estrategias del portafolio campeón para reducir el riesgo. "
-                        "No cambia las estrategias, solo su ponderación. La simulación del portafolio HRP es estocástica, por lo que los resultados pueden variar ligeramente en cada ejecución."
+                        "No cambia las estrategias, solo su ponderación."
                     )
 
                     if st.button("🚀 Refinar Portafolio con Hierarchical Risk Parity (HRP)"):
@@ -1214,8 +1376,7 @@ else:
                             st.warning(
                                 "HRP requiere al menos 2 estrategias en el portafolio para poder calcular las ponderaciones.")
                         else:
-                            with st.spinner(
-                                    "Calculando pesos HRP y simulando los portafolios refinados (In-Sample y Out-of-Sample)..."):
+                            with st.spinner("Calculando pesos HRP y simulando los portafolios refinados..."):
                                 daily_returns_df = get_daily_returns(champion_trades_is)
 
                                 if daily_returns_df.empty or daily_returns_df.shape[1] < 2:
@@ -1223,178 +1384,287 @@ else:
                                         "No se pudieron calcular los retornos diarios para las estrategias. No se puede ejecutar HRP.")
                                 else:
                                     hrp_weights = get_hrp_weights(daily_returns_df)
-                                    hrp_portfolio_trades_is = create_hrp_resampled_portfolio(champion_trades_is,
-                                                                                             hrp_weights)
 
-                                    hrp_results_dict = {
-                                        "weights": hrp_weights,
-                                        "original_trades_is": champion_trades_is,
-                                        "hrp_trades_is": hrp_portfolio_trades_is,
-                                        "oos_results": {}
+                                    # --- INICIO: LÓGICA DE COMPARACIÓN HRP ---
+                                    # 1. Simulación HRP Resampling (Estadística)
+                                    hrp_portfolio_resampled_is = create_hrp_resampled_portfolio(champion_trades_is,
+                                                                                                hrp_weights)
+                                    _, final_balance_resampled_is, dd_resampled_is = run_portfolio_simulation(
+                                        hrp_portfolio_resampled_is, initial_capital, risk_per_trade_pct, r_multiple_cap,
+                                        fixed_risk_amount, riesgo_historico_por_trade)
+                                    cagr_resampled_is = calculate_cagr(initial_capital, final_balance_resampled_is,
+                                                                       champion_trades_is)
+                                    mar_resampled_is = calculate_mar(cagr_resampled_is, dd_resampled_is)
+                                    profit_resampled_is = ((final_balance_resampled_is / initial_capital) - 1) * 100
+
+                                    # 2. Simulación HRP Operativa (Alta Fidelidad)
+                                    _, final_balance_op_is, dd_op_is = run_operational_simulation_with_rebalancing(
+                                        champion_trades_is, initial_capital, risk_per_trade_pct, hrp_weights,
+                                        r_multiple_cap, riesgo_historico_por_trade, fixed_risk_amount)
+                                    cagr_op_is = calculate_cagr(initial_capital, final_balance_op_is,
+                                                                champion_trades_is)
+                                    mar_op_is = calculate_mar(cagr_op_is, dd_op_is)
+                                    profit_op_is = ((final_balance_op_is / initial_capital) - 1) * 100
+
+                                    hrp_comparison_data = {
+                                        "Métrica": ["MAR Ratio", "Max Drawdown (%)", "Profit (%)"],
+                                        "Original (Equiponderado)": [f"{is_mar:.2f}", f"{is_dd:.2f}%",
+                                                                     f"{is_profit:.2f}%"],
+                                        "HRP (Sim. Estadística)": [f"{mar_resampled_is:.2f}", f"{dd_resampled_is:.2f}%",
+                                                                   f"{profit_resampled_is:.2f}%"],
+                                        "HRP (Sim. Operativa Real)": [f"{mar_op_is:.2f}", f"{dd_op_is:.2f}%",
+                                                                      f"{profit_op_is:.2f}%"],
                                     }
+                                    st.session_state.hrp_comparison_is = hrp_comparison_data
 
-                                    # --- NUEVA LÓGICA PARA OOS ---
+                                    # 3. Misma comparación para Out-of-Sample si existe
                                     if oos_percentage > 0 and not validation_data.empty:
                                         champion_trades_oos = validation_data[
                                             validation_data['Result name'].isin(list(champion_combo))]
-                                        if not champion_trades_oos.empty:
-                                            hrp_portfolio_trades_oos = create_hrp_resampled_portfolio(
-                                                champion_trades_oos, hrp_weights)
-                                            if not hrp_portfolio_trades_oos.empty:
-                                                hrp_results_dict["oos_results"] = {
-                                                    "original_trades_oos": champion_trades_oos,
-                                                    "hrp_trades_oos": hrp_portfolio_trades_oos
-                                                }
+                                        # HRP Resampling OOS
+                                        hrp_portfolio_resampled_oos = create_hrp_resampled_portfolio(
+                                            champion_trades_oos, hrp_weights)
+                                        _, final_balance_resampled_oos, dd_resampled_oos = run_portfolio_simulation(
+                                            hrp_portfolio_resampled_oos, initial_capital, risk_per_trade_pct,
+                                            r_multiple_cap, fixed_risk_amount, riesgo_historico_por_trade)
+                                        cagr_resampled_oos = calculate_cagr(initial_capital,
+                                                                            final_balance_resampled_oos,
+                                                                            champion_trades_oos)
+                                        mar_resampled_oos = calculate_mar(cagr_resampled_oos, dd_resampled_oos)
+                                        profit_resampled_oos = ((
+                                                                            final_balance_resampled_oos / initial_capital) - 1) * 100
+                                        # HRP Operativa OOS
+                                        _, final_balance_op_oos, dd_op_oos = run_operational_simulation_with_rebalancing(
+                                            champion_trades_oos, initial_capital, risk_per_trade_pct, hrp_weights,
+                                            r_multiple_cap, riesgo_historico_por_trade, fixed_risk_amount)
+                                        cagr_op_oos = calculate_cagr(initial_capital, final_balance_op_oos,
+                                                                     champion_trades_oos)
+                                        mar_op_oos = calculate_mar(cagr_op_oos, dd_op_oos)
+                                        profit_op_oos = ((final_balance_op_oos / initial_capital) - 1) * 100
 
-                                    st.session_state.hrp_results = hrp_results_dict
+                                        hrp_comparison_data_oos = {
+                                            "Métrica": ["MAR Ratio", "Max Drawdown (%)", "Profit (%)"],
+                                            "Original (Equiponderado)": [f"{oos_mar:.2f}", f"{oos_dd:.2f}%",
+                                                                         f"{oos_profit:.2f}%"],
+                                            "HRP (Sim. Estadística)": [f"{mar_resampled_oos:.2f}",
+                                                                       f"{dd_resampled_oos:.2f}%",
+                                                                       f"{profit_resampled_oos:.2f}%"],
+                                            "HRP (Sim. Operativa Real)": [f"{mar_op_oos:.2f}", f"{dd_op_oos:.2f}%",
+                                                                          f"{profit_op_oos:.2f}%"],
+                                        }
+                                        st.session_state.hrp_comparison_oos = hrp_comparison_data_oos
+                                    # --- FIN: LÓGICA DE COMPARACIÓN HRP ---
+
+                                    st.session_state.hrp_results = {"weights": hrp_weights}
                                     st.success("Análisis HRP completado.")
 
                     if 'hrp_results' in st.session_state:
                         hrp_res = st.session_state.hrp_results
                         hrp_weights = hrp_res["weights"]
 
-                        params_for_metrics = {
-                            "_calculation_mode": calculation_mode, "_initial_capital": initial_capital,
-                            "_risk_per_trade_pct": risk_per_trade_pct, "_r_multiple_cap": r_multiple_cap,
-                            "_fixed_risk_amount": fixed_risk_amount,
-                            "_riesgo_historico_por_trade": riesgo_historico_por_trade
-                        }
+                        st.subheader("⚖️ Asignación de Capital HRP")
+                        weights_df = hrp_weights.reset_index();
+                        weights_df.columns = ['Estrategia', 'Peso']
+                        weights_df['Peso'] = weights_df['Peso'] * 100
+                        fig_weights = px.bar(weights_df.sort_values('Peso', ascending=True), x='Peso', y='Estrategia',
+                                             orientation='h', text=weights_df['Peso'].apply(lambda x: f'{x:.1f}%'))
+                        st.plotly_chart(fig_weights, use_container_width=True)
 
+                        if 'hrp_comparison_is' in st.session_state:
+                            st.subheader("📊 Comparativa de Rendimiento: Equiponderado vs. HRP")
+                            with st.expander("🔍 Cómo interpretar esta tabla"):
+                                st.markdown("""
+                                - **Original (Equiponderado):** Es el rendimiento base, sin usar los pesos HRP.
+                                - **HRP (Sim. Estadística):** Es el resultado de la simulación por *resampling*. Es una prueba teórica de la eficacia de los pesos.
+                                - **HRP (Sim. Operativa Real):** **ESTA ES LA MÁS IMPORTANTE.** Simula el rendimiento que habrías obtenido aplicando los pesos HRP con el método de "cajas de capital" y rebalanceo semanal. Es la que más se aproxima a la realidad.
+                                """)
 
-                        def format_improvement(value, is_dd=False):
-                            if not np.isfinite(value): return "N/A"
-                            if is_dd: value = -value
-                            if value > 0:
-                                return f"🟢 +{value:.1f}%"
-                            elif value < 0:
-                                return f"🔴 {value:.1f}%"
+                            st.write("**Resultados In-Sample (Entrenamiento)**")
+                            comp_is_df = pd.DataFrame(st.session_state.hrp_comparison_is).set_index("Métrica")
+                            st.dataframe(comp_is_df, use_container_width=True)
+
+                        if 'hrp_comparison_oos' in st.session_state:
+                            st.write("**Resultados Out-of-Sample (Validación)**")
+                            comp_oos_df = pd.DataFrame(st.session_state.hrp_comparison_oos).set_index("Métrica")
+                            st.dataframe(comp_oos_df, use_container_width=True)
+
+                        # --- INICIO: SECCIÓN DE GESTIÓN DE RIESGO DINÁMICA (OPTIMAL F) ---
+                        st.markdown("---");
+                        st.header("Paso 4: Simulación Walk-Forward con Gestión de Riesgo Dinámica (Optimal F)")
+                        st.info(
+                            "Esta herramienta utiliza el **motor de simulación operativa de alta fidelidad** para probar el rendimiento del portafolio HRP a lo largo del período OOS. "
+                            "El riesgo no es fijo, sino que se recalcula anualmente basándose en el Optimal F del histórico reciente."
+                        )
+
+                        wf_col1, wf_col2 = st.columns(2)
+                        with wf_col1:
+                            optimal_f_fraction = st.slider(
+                                "Porcentaje de Optimal F a aplicar (%)",
+                                min_value=1, max_value=100, value=20, step=1,
+                                help="Fracción del Optimal F a arriesgar. Usar el 100% puede ser muy agresivo. Se recomienda empezar con 20-30%.")
+                        with wf_col2:
+                            optimal_f_window_years = st.number_input(
+                                "Años de datos para calcular Optimal F",
+                                min_value=1, max_value=10, value=5, step=1,
+                                help="Ventana móvil de datos históricos para recalcular el riesgo cada año.")
+
+                        if st.button("🚀 Iniciar Simulación Walk-Forward Sencilla"):
+                            if riesgo_historico_por_trade <= 0:
+                                st.error(
+                                    "La simulación con Optimal F requiere un 'Riesgo Histórico Asumido por Trade ($)' mayor que cero.")
+                            elif oos_percentage == 0 or validation_data.empty:
+                                st.error("Esta simulación requiere un set de datos de validación (Out-of-Sample).")
                             else:
-                                return f"⚪️ {value:.1f}%"
+                                with st.spinner("Ejecutando simulación de alta fidelidad..."):
+                                    champion_combo = tuple(sorted(res['absolute_champion']['combo']))
+                                    champion_trades_is = training_data[
+                                        training_data['Result name'].isin(list(champion_combo))]
+                                    champion_trades_oos = validation_data[
+                                        validation_data['Result name'].isin(list(champion_combo))]
 
+                                    dyn_cagr, dyn_dd, dyn_mar, dyn_equity, annual_f_data = run_walk_forward_simulation(
+                                        champion_trades_is, champion_trades_oos, hrp_res["weights"], initial_capital,
+                                        optimal_f_fraction / 100.0, optimal_f_window_years,
+                                        riesgo_historico_por_trade, r_multiple_cap
+                                    )
 
-                        # --- RENDERIZADO IN-SAMPLE ---
-                        st.subheader("📊 Tabla Comparativa de Rendimiento (In-Sample)")
-                        original_trades_is = hrp_res["original_trades_is"]
-                        hrp_trades_is = hrp_res["hrp_trades_is"]
+                                    st.subheader("Comparativa Global: Riesgo Fijo vs. Riesgo Dinámico (Optimal F)")
 
-                        orig_is_mar, orig_is_dd, orig_is_profit = get_portfolio_metrics_final(original_trades_is, tuple(
-                            original_trades_is['Result name'].unique()), **params_for_metrics)
-                        hrp_is_mar, hrp_is_dd, hrp_is_profit = get_portfolio_metrics_final(hrp_trades_is, tuple(
-                            hrp_trades_is['Result name'].unique()), **params_for_metrics)
+                                    # Métricas de Riesgo Fijo (Equiponderado, sin HRP, como baseline)
+                                    _, fixed_final_balance, fixed_dd = run_portfolio_simulation(champion_trades_oos,
+                                                                                                initial_capital,
+                                                                                                risk_per_trade_pct,
+                                                                                                r_multiple_cap,
+                                                                                                fixed_risk_amount,
+                                                                                                riesgo_historico_por_trade)
+                                    retorno_total_fijo = ((
+                                                                      fixed_final_balance / initial_capital) - 1) * 100 if initial_capital > 0 else 0
+                                    multiplicador_fijo = fixed_final_balance / initial_capital if initial_capital > 0 else 0
+                                    mar_adj_fijo = retorno_total_fijo / fixed_dd if fixed_dd > 0 else np.inf
 
-                        is_mar_imp = ((hrp_is_mar / orig_is_mar) - 1) * 100 if orig_is_mar != 0 else float('inf')
-                        is_dd_imp = ((orig_is_dd / hrp_is_dd) - 1) * 100 if hrp_is_dd != 0 else float('inf')
-                        is_profit_imp = ((hrp_is_profit / orig_is_profit) - 1) * 100 if orig_is_profit != 0 else float(
-                            'inf')
+                                    # Métricas de Riesgo Dinámico (Alta Fidelidad, con HRP + Optimal F)
+                                    dyn_final_balance = dyn_equity.iloc[-1]
+                                    retorno_total_dinamico = ((
+                                                                          dyn_final_balance / initial_capital) - 1) * 100 if initial_capital > 0 else 0
+                                    multiplicador_dinamico = dyn_final_balance / initial_capital if initial_capital > 0 else 0
+                                    mar_adj_dinamico = retorno_total_dinamico / dyn_dd if dyn_dd > 0 else np.inf
 
-                        comparison_is_df = pd.DataFrame({
-                            "Métrica": ["MAR Ratio", "Max Drawdown (%)", "Rentabilidad (%)"],
-                            "Portafolio Original": [f"{orig_is_mar:.2f}", f"{orig_is_dd:.2f}%",
-                                                    f"{orig_is_profit:.2f}%"],
-                            "Portafolio Refinado (HRP)": [f"{hrp_is_mar:.2f}", f"{hrp_is_dd:.2f}%",
-                                                          f"{hrp_is_profit:.2f}%"],
-                            "Mejora": [format_improvement(is_mar_imp), format_improvement(-is_dd_imp),
-                                       format_improvement(is_profit_imp)]
-                        })
-                        st.dataframe(comparison_is_df.set_index("Métrica"), use_container_width=True)
+                                    comparison_data = {
+                                        "Métrica": ["Multiplicador de Capital", "Retorno Total en OOS (%)",
+                                                    "Max Drawdown (%)", "MAR Ratio (Ajustado)"],
+                                        "Portafolio Baseline (Sin HRP, Riesgo Fijo)": [f"{multiplicador_fijo:.2f}x",
+                                                                                       f"{retorno_total_fijo:.2f}",
+                                                                                       f"{fixed_dd:.2f}",
+                                                                                       f"{mar_adj_fijo:.2f}"],
+                                        "Portafolio Avanzado (HRP + Riesgo Dinámico)": [
+                                            f"{multiplicador_dinamico:.2f}x", f"{retorno_total_dinamico:.2f}",
+                                            f"{dyn_dd:.2f}", f"{mar_adj_dinamico:.2f}"]
+                                    }
 
-                        hrp_col1, hrp_col2 = st.columns(2)
-                        with hrp_col1:
-                            st.subheader("⚖️ Asignación de Capital HRP")
-                            weights_df = hrp_weights.reset_index()
-                            weights_df.columns = ['Estrategia', 'Peso']
-                            weights_df['Peso'] = weights_df['Peso'] * 100  # convertir a %
+                                    st.dataframe(pd.DataFrame(comparison_data).set_index("Métrica"),
+                                                 use_container_width=True)
 
-                            # ordenamos el DF y lo guardamos (muy importante)
-                            weights_sorted = weights_df.sort_values('Peso', ascending=True)
+                                    st.subheader("Curva de Capital con Riesgo Dinámico (Out-of-Sample)")
+                                    fig_dyn_equity = px.line(dyn_equity,
+                                                             title="Curva de Capital Simulada (Riesgo Dinámico)",
+                                                             labels={"value": "Capital", "index": "Fecha"})
+                                    st.plotly_chart(fig_dyn_equity.update_layout(showlegend=False),
+                                                    use_container_width=True)
 
-                            fig_weights = px.bar(
-                                weights_sorted,
-                                x='Peso',
-                                y='Estrategia',
-                                orientation='h',
-                                text=weights_sorted['Peso'].apply(lambda x: f"{x:.1f}%"),
-                            )
+                                    if annual_f_data:
+                                        st.subheader("Riesgo Anual Aplicado (Walk-Forward)")
+                                        st.dataframe(
+                                            pd.DataFrame(annual_f_data).set_index("Año de Aplicación").style.format({
+                                                "Optimal F Calculado": "{:.2f}",
+                                                "Riesgo Aplicado (%)": "{:.2f}%"
+                                            }), use_container_width=True)
 
-                            # ajusta eje y añade margen a la derecha
-                            fig_weights.update_layout(
-                                xaxis=dict(range=[0, weights_sorted['Peso'].max() * 1.10])
-                            )
-                            fig_weights.update_traces(textposition='outside')
-                            st.plotly_chart(fig_weights, use_container_width=True)
+                        # --- INICIO: NUEVA SECCIÓN DE CALIBRACIÓN ---
+                        st.markdown("---")
+                        st.header("Paso 5: Calibración de Riesgo Dinámico (Búsqueda de MAR Óptimo)")
+                        st.info(
+                            "Este proceso utiliza la **simulación operativa de alta fidelidad** para probar múltiples fracciones de Optimal F en los datos de entrenamiento (In-Sample) "
+                            "y encontrar la que produce el mejor MAR Ratio. Luego, valida esa fracción en los datos Out-of-Sample para confirmar su robustez."
+                        )
 
-                        with hrp_col2:
-                            st.subheader("📈 Curvas de Capital (In-Sample)")
-                            if calculation_mode == 'Simulación (Interés Compuesto)':
-                                ec_orig, _, _ = run_portfolio_simulation(original_trades_is,
-                                                                         **{k.lstrip('_'): v for k, v in
-                                                                            params_for_metrics.items() if
-                                                                            k != '_calculation_mode'})
-                                ec_hrp, _, _ = run_portfolio_simulation(hrp_trades_is, **{k.lstrip('_'): v for k, v in
-                                                                                          params_for_metrics.items() if
-                                                                                          k != '_calculation_mode'})
+                        max_f_fraction_pct = st.slider(
+                            "Rango máximo de fracción de F a probar (%)",
+                            min_value=10, max_value=100, value=40, step=5,
+                            help="Define el límite superior para la búsqueda de la fracción óptima de F. Si el resultado es el valor máximo, considera aumentarlo."
+                        )
+
+                        if st.button("🚀 Iniciar Calibración y Validación de Riesgo"):
+                            if riesgo_historico_por_trade <= 0:
+                                st.error("Se requiere un 'Riesgo Histórico Asumido por Trade ($)' > 0.")
+                            elif oos_percentage == 0 or validation_data.empty:
+                                st.error("Se requiere un set de datos Out-of-Sample para una calibración robusta.")
                             else:
-                                ec_orig, _, _, _, _ = calculate_isolated_historical_performance(original_trades_is)
-                                ec_hrp, _, _, _, _ = calculate_isolated_historical_performance(hrp_trades_is)
-                            fig_curves = go.Figure()
-                            fig_curves.add_trace(
-                                go.Scatter(x=ec_orig.index, y=ec_orig.values, mode='lines', name='Original'))
-                            fig_curves.add_trace(
-                                go.Scatter(x=ec_hrp.index, y=ec_hrp.values, mode='lines', name='Refinado (HRP)'))
-                            st.plotly_chart(fig_curves, use_container_width=True)
+                                with st.spinner(
+                                        "Ejecutando análisis de sensibilidad con simulación de alta fidelidad... Esto puede tardar varios minutos."):
+                                    champion_combo = tuple(sorted(res['absolute_champion']['combo']))
+                                    champion_trades_is = training_data[
+                                        training_data['Result name'].isin(list(champion_combo))]
+                                    champion_trades_oos = validation_data[
+                                        validation_data['Result name'].isin(list(champion_combo))]
 
-                        # --- RENDERIZADO OUT-OF-SAMPLE ---
-                        if hrp_res.get("oos_results"):
-                            st.markdown("---")
-                            st.subheader("📊 Tabla Comparativa de Rendimiento (Out-of-Sample)")
-                            original_trades_oos = hrp_res["oos_results"]["original_trades_oos"]
-                            hrp_trades_oos = hrp_res["oos_results"]["hrp_trades_oos"]
+                                    sensitivity_df, best_row, validation_res, annual_f_data_validation = find_optimal_mar_fraction(
+                                        champion_trades_is, champion_trades_oos, hrp_res["weights"], initial_capital,
+                                        optimal_f_window_years, riesgo_historico_por_trade, r_multiple_cap,
+                                        max_f_fraction_pct
+                                    )
 
-                            orig_oos_mar, orig_oos_dd, orig_oos_profit = get_portfolio_metrics_final(
-                                original_trades_oos, tuple(original_trades_oos['Result name'].unique()),
-                                **params_for_metrics)
-                            hrp_oos_mar, hrp_oos_dd, hrp_oos_profit = get_portfolio_metrics_final(hrp_trades_oos, tuple(
-                                hrp_trades_oos['Result name'].unique()), **params_for_metrics)
+                                    if sensitivity_df is not None:
+                                        st.subheader("1. Tabla de Sensibilidad (Resultados In-Sample)")
+                                        st.dataframe(sensitivity_df.style.format({
+                                            "CAGR (IS)": "{:,.2f}%",
+                                            "Max Drawdown (IS) (%)": "{:,.2f}",
+                                            "MAR Ratio (IS)": "{:,.2f}"
+                                        }), use_container_width=True)
 
-                            oos_mar_imp = ((hrp_oos_mar / orig_oos_mar) - 1) * 100 if orig_oos_mar != 0 else float(
-                                'inf')
-                            oos_dd_imp = ((orig_oos_dd / hrp_oos_dd) - 1) * 100 if hrp_oos_dd != 0 else float('inf')
-                            oos_profit_imp = ((
-                                                          hrp_oos_profit / orig_oos_profit) - 1) * 100 if orig_oos_profit != 0 else float(
-                                'inf')
+                                        st.subheader("2. Conclusión de la Calibración")
+                                        st.success(
+                                            f"La fracción óptima en el período de entrenamiento fue **{best_row['Fracción de F Aplicada']}**, "
+                                            f"produciendo un MAR Ratio de **{best_row['MAR Ratio (IS)']:.2f}**.")
+                                        st.markdown(
+                                            "**Recomendación:** Analiza la tabla. Si hay una 'meseta' de buenos resultados, considera elegir un valor "
+                                            "conservador dentro de esa zona en lugar del pico absoluto para mayor robustez."
+                                        )
 
-                            comparison_oos_df = pd.DataFrame({
-                                "Métrica": ["MAR Ratio", "Max Drawdown (%)", "Rentabilidad (%)"],
-                                "Portafolio Original": [f"{orig_oos_mar:.2f}", f"{orig_oos_dd:.2f}%",
-                                                        f"{orig_oos_profit:.2f}%"],
-                                "Portafolio Refinado (HRP)": [f"{hrp_oos_mar:.2f}", f"{hrp_oos_dd:.2f}%",
-                                                              f"{hrp_oos_profit:.2f}%"],
-                                "Mejora": [format_improvement(oos_mar_imp), format_improvement(-oos_dd_imp),
-                                           format_improvement(oos_profit_imp)]
-                            })
-                            st.dataframe(comparison_oos_df.set_index("Métrica"), use_container_width=True)
+                                        st.subheader("3. Resultados de la Validación (Out-of-Sample)")
+                                        st.write(
+                                            f"A continuación, se muestran los resultados al aplicar la fracción recomendada "
+                                            f"de **{best_row['Fracción de F Aplicada']}** a los datos de validación.")
 
-                            st.subheader("📈 Curvas de Capital (Out-of-Sample)")
-                            if calculation_mode == 'Simulación (Interés Compuesto)':
-                                ec_orig_oos, _, _ = run_portfolio_simulation(original_trades_oos,
-                                                                             **{k.lstrip('_'): v for k, v in
-                                                                                params_for_metrics.items() if
-                                                                                k != '_calculation_mode'})
-                                ec_hrp_oos, _, _ = run_portfolio_simulation(hrp_trades_oos,
-                                                                            **{k.lstrip('_'): v for k, v in
-                                                                               params_for_metrics.items() if
-                                                                               k != '_calculation_mode'})
-                            else:
-                                ec_orig_oos, _, _, _, _ = calculate_isolated_historical_performance(original_trades_oos)
-                                ec_hrp_oos, _, _, _, _ = calculate_isolated_historical_performance(hrp_trades_oos)
+                                        oos_df = pd.DataFrame([validation_res])
+                                        st.dataframe(oos_df.style.format({
+                                            "CAGR (OOS)": "{:,.2f}%",
+                                            "Max Drawdown (OOS) (%)": "{:,.2f}",
+                                            "MAR Ratio (OOS)": "{:,.2f}"
+                                        }), use_container_width=True)
 
-                            fig_curves_oos = go.Figure()
-                            fig_curves_oos.add_trace(go.Scatter(x=ec_orig_oos.index, y=ec_orig_oos.values, mode='lines',
-                                                                name='Original (OOS)'))
-                            fig_curves_oos.add_trace(go.Scatter(x=ec_hrp_oos.index, y=ec_hrp_oos.values, mode='lines',
-                                                                name='Refinado HRP (OOS)'))
-                            st.plotly_chart(fig_curves_oos, use_container_width=True)
-                    # --- FIN: SECCIÓN DE REFINAMIENTO CON HRP ---
+                                        degradation = ((validation_res['MAR Ratio (OOS)'] - best_row[
+                                            'MAR Ratio (IS)']) / best_row['MAR Ratio (IS)']) * 100 if best_row[
+                                                                                                          'MAR Ratio (IS)'] != 0 else 0
+                                        if degradation < -50:
+                                            st.error(
+                                                f"🔴 ¡Peligro! El MAR Ratio se degradó en un {abs(degradation):.1f}%. El modelo está probablemente sobreajustado.")
+                                        elif degradation < -25:
+                                            st.warning(
+                                                f"🟡 Advertencia: El MAR Ratio se degradó en un {abs(degradation):.1f}%. Procede con cautela.")
+                                        else:
+                                            st.success(
+                                                f"🟢 Robusto: El rendimiento se mantuvo bien en el período de validación (Degradación del MAR: {degradation:.1f}%).")
+
+                                        if annual_f_data_validation:
+                                            st.subheader("4. Desglose del Riesgo Anual Aplicado en la Validación (OOS)")
+                                            st.write(
+                                                f"Estos son los valores de Optimal F calculados anualmente y el riesgo real aplicado usando la fracción recomendada de **{best_row['Fracción de F Aplicada']}**.")
+                                            st.dataframe(pd.DataFrame(annual_f_data_validation).set_index(
+                                                "Año de Aplicación").style.format({
+                                                "Optimal F Calculado": "{:.2f}",
+                                                "Riesgo Aplicado (%)": "{:.2f}%"
+                                            }), use_container_width=True)
+                        # --- FIN: NUEVA SECCIÓN DE CALIBRACIÓN ---
 
             with tab3:
                 st.header("Análisis de Riesgo y Peores Escenarios")
@@ -1426,7 +1696,7 @@ else:
 
                         dd_threshold_sim = st.slider(
                             "Umbral de Drawdown para Análisis (%)",
-                            min_value=0.1, max_value=20.0, value=2.0, step=0.1,
+                            min_value=0.1, max_value=100.0, value=2.0, step=0.1,
                             key="dd_threshold_sim",
                             help="Solo las caídas superiores a este porcentaje se considerarán para el análisis de duración y frecuencia."
                         )
@@ -1486,7 +1756,7 @@ else:
 
                             dd_threshold_hist = st.slider(
                                 "Umbral de Drawdown para Análisis (%)",
-                                min_value=0.1, max_value=20.0, value=2.0, step=0.1,
+                                min_value=0.1, max_value=100.0, value=2.0, step=0.1,
                                 key="dd_threshold_hist",
                                 help="Solo las caídas superiores a este porcentaje se considerarán para el análisis de duración y frecuencia."
                             )
